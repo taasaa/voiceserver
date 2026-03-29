@@ -1,8 +1,7 @@
 export const PORT = 8888
-export const LITELLM_URL = "http://localhost:4000/v1/audio/speech"
-export const LITELLM_KEY = "sk-1234"
-export const LITELLM_MODEL = "local-tts"
-export const AUDIO_FORMAT = "wav"
+export const TTS_URL = "http://localhost:8001/v1/audio/speech"
+export const TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+export const AUDIO_FORMAT = "mp3"
 export const VOICES_FILE = import.meta.dir + "/voices.json"
 
 const defaultVoice = "A clear, professional male voice. Calm and direct, mid-range pitch."

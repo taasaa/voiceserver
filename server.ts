@@ -1,18 +1,16 @@
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs"
 import {
   PORT,
-  LITELLM_URL,
-  LITELLM_KEY,
-  LITELLM_MODEL,
+  TTS_URL,
+  TTS_MODEL,
   AUDIO_FORMAT,
   VOICES_FILE,
   VOICE_POOL,
   SEED_VOICES,
 } from "./config"
 
-// ── Voice Registry (in-memory cache) ────────────────────────
+// ── Voice Registry ──────────────────────────────────────────
 
-let poolIndex = 0
 let voices = loadVoices()
 
 function loadVoices(): Record<string, string> {
@@ -24,47 +22,45 @@ function loadVoices(): Record<string, string> {
   }
 }
 
-function saveVoices() {
-  writeFileSync(VOICES_FILE, JSON.stringify(voices, null, 2))
-}
+let poolIndex = Object.keys(voices).length
 
 function resolveVoice(voiceId: string): string {
   if (voices[voiceId]) return voices[voiceId]
-
   voices[voiceId] = VOICE_POOL[poolIndex % VOICE_POOL.length]
   poolIndex++
-  saveVoices()
+  writeFileSync(VOICES_FILE, JSON.stringify(voices, null, 2))
   return voices[voiceId]
 }
 
-// ── TTS via LiteLLM ─────────────────────────────────────────
+// ── TTS via local mlx-audio (through tts-proxy) ─────────────
 
-async function synthesize(input: string, voice: string, speed: number): Promise<ArrayBuffer | null> {
-  const response = await fetch(LITELLM_URL, {
+async function synthesize(text: string, voice: string, speed: number): Promise<ArrayBuffer | null> {
+  const res = await fetch(TTS_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LITELLM_KEY}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: LITELLM_MODEL,
-      input,
+      model: TTS_MODEL,
+      input: text,
       voice,
+      instruct: voice,
       response_format: AUDIO_FORMAT,
       speed,
     }),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(60_000),
   })
 
-  if (!response.ok) return null
+  if (!res.ok) {
+    console.error(`TTS error: ${res.status} ${await res.text().catch(() => "")}`)
+    return null
+  }
 
-  const ct = response.headers.get("content-type") ?? ""
+  const ct = res.headers.get("content-type") ?? ""
   if (!ct.includes("audio")) return null
 
-  return response.arrayBuffer()
+  return res.arrayBuffer()
 }
 
-// ── Audio Playback ──────────────────────────────────────────
+// ── Local Audio Playback ────────────────────────────────────
 
 let tmpCounter = 0
 
@@ -79,38 +75,53 @@ function playAudio(buffer: ArrayBuffer) {
   })
 }
 
-// ── HTTP Server ─────────────────────────────────────────────
+// ── Server — accepts from any source ────────────────────────
 
 Bun.serve({
+  hostname: "0.0.0.0",
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url)
 
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      })
+    }
+
+    const corsHeaders = { "Access-Control-Allow-Origin": "*" }
+
     if (url.pathname === "/health" && req.method === "GET") {
-      return new Response("ok")
+      return new Response("ok", { headers: corsHeaders })
     }
 
     if (url.pathname === "/notify" && req.method === "POST") {
       let body: any
-      try { body = await req.json() } catch { return new Response("ok") }
+      try { body = await req.json() } catch { return new Response("ok", { headers: corsHeaders }) }
 
       const message: string = body?.message
-      const voiceId: string = body?.voice_id || "default"
+      const voiceId: string = body?.voice_id ?? "default"
       const voiceEnabled: boolean = body?.voice_enabled !== false
       const speed: number = body?.voice_settings?.speed ?? 1.0
 
-      if (!message || !voiceEnabled) return new Response("ok")
+      if (!message || !voiceEnabled) return new Response("ok", { headers: corsHeaders })
 
+      // Fire-and-forget: respond immediately, TTS plays async
       const voice = resolveVoice(voiceId)
-      const audio = await synthesize(message, voice, speed)
+      synthesize(message, voice, speed).then(audio => { if (audio) playAudio(audio) })
 
-      if (audio) playAudio(audio)
-
-      return new Response("ok")
+      return new Response("ok", { headers: corsHeaders })
     }
 
-    return new Response("not found", { status: 404 })
+    return new Response("not found", { status: 404, headers: corsHeaders })
   },
 })
 
-console.log(`Voice server listening on :${PORT}`)
+const ttsHost = new URL(TTS_URL).host
+console.log(`Voice server listening on 0.0.0.0:${PORT} → ${ttsHost}`)
