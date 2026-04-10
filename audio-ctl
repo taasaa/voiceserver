@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# audio-ctl — Manage voiceserver stack (mlx-audio STT/TTS + tts-proxy + voiceserver)
+# Usage: audio-ctl <command> [args]
+#
+# Manages the full voice pipeline:
+#   voiceserver (8888) → tts-proxy (8001) → mlx-audio (8000)
+
+VENV="$HOME/.venvs/audio-services"
+PLIST="$HOME/Library/LaunchAgents/com.local.voiceserver.plist"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKDIR="$SCRIPT_DIR/workspace"
+
+MLX_PORT="8000"
+PROXY_PORT="8001"
+VOICE_PORT="8888"
+
+MLX_PID="$WORKDIR/mlx-audio.pid"
+MLX_LOG="$WORKDIR/mlx-audio.log"
+MLX_ERR="$WORKDIR/mlx-audio.err"
+PROXY_PID="$WORKDIR/tts-proxy.pid"
+PROXY_LOG="$WORKDIR/tts-proxy.log"
+VOICE_PID="$WORKDIR/voiceserver.pid"
+VOICE_LOG="$WORKDIR/voiceserver.log"
+
+PLIST_LABEL="com.local.voiceserver"
+TTS_MODEL="mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+STT_MODEL="mlx-community/Qwen3-ASR-1.7B-8bit"
+VOICE="A calm, focused AI assistant with a natural American male voice."
+
+_red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
+_green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+_yellow(){ printf '\033[0;33m%s\033[0m\n' "$*"; }
+
+_check_venv() {
+    if [[ ! -d "$VENV" ]]; then
+        _red "Venv not found at $VENV"
+        _yellow "Run: uv venv $VENV --python 3.10 && source $VENV/bin/activate && uv pip install 'mlx-audio[all,server]' --prerelease=allow"
+        exit 1
+    fi
+}
+
+_check_bun() {
+    if ! command -v bun &>/dev/null; then
+        _red "bun not found in PATH"
+        exit 1
+    fi
+}
+
+_ensure_workdir() {
+    mkdir -p "$WORKDIR"
+}
+
+# Generic process management — eliminates duplicated _start_*/_stop_* functions
+
+_is_running() {
+    local pid_file="$1"
+    [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+}
+
+_stop_service() {
+    local name="$1" pid_file="$2"
+    if _is_running "$pid_file"; then
+        kill "$(cat "$pid_file")"
+        rm -f "$pid_file"
+        _green "$name stopped."
+    else
+        rm -f "$pid_file"
+        _yellow "$name not running."
+    fi
+}
+
+# Usage: _start_service <name> <pid_file> <log_file> [--health <url> <retries>] [--stderr <err_file>] -- <cmd> [args...]
+_start_service() {
+    local name="$1" pid_file="$2" log_file="$3"
+    shift 3
+
+    if _is_running "$pid_file"; then
+        _yellow "$name already running (PID $(cat "$pid_file"))."
+        return 0
+    fi
+
+    _ensure_workdir
+
+    local health_url="" health_retries=0 err_file=""
+    while [[ "${1:-}" =~ ^-- ]]; do
+        case "$1" in
+            --health)   health_url="$2"; health_retries="${3:-15}"; shift 3 ;;
+            --stderr)   err_file="$2"; shift 2 ;;
+            --)         shift; break ;;
+        esac
+    done
+
+    echo "Starting $name..."
+    if [[ -n "$err_file" ]]; then
+        nohup "$@" > "$log_file" 2> "$err_file" &
+    else
+        nohup "$@" > "$log_file" 2>&1 &
+    fi
+    echo $! > "$pid_file"
+
+    if [[ -n "$health_url" && "$health_retries" -gt 0 ]]; then
+        local retries=$health_retries
+        while (( retries-- > 0 )); do
+            if curl -sf -o /dev/null --max-time 2 "$health_url" 2>/dev/null; then
+                _green "$name started (PID $(cat "$pid_file"))."
+                return 0
+            fi
+            sleep 1
+        done
+        if _is_running "$pid_file"; then
+            _yellow "$name process alive but not healthy yet (PID $(cat "$pid_file"))."
+        else
+            _red "$name failed to start. Check $log_file"
+        fi
+    else
+        sleep 1
+        if _is_running "$pid_file"; then
+            _green "$name started (PID $(cat "$pid_file"))."
+        else
+            _red "$name failed to start. Check $log_file"
+        fi
+    fi
+}
+
+_download_models() {
+    _check_venv
+    local python="$VENV/bin/python3"
+    echo "Downloading TTS: $TTS_MODEL"
+    "$python" -c "from huggingface_hub import snapshot_download; snapshot_download('$TTS_MODEL')"
+    echo "Downloading STT: $STT_MODEL"
+    "$python" -c "from huggingface_hub import snapshot_download; snapshot_download('$STT_MODEL')"
+}
+
+# ── Commands ──
+
+cmd_start() {
+    _check_venv
+    _check_bun
+    _ensure_workdir
+
+    if [[ -f "$PLIST" ]]; then
+        if launchctl list "$PLIST_LABEL" &>/dev/null 2>&1; then
+            _yellow "Voice server plist already loaded."
+        else
+            launchctl load "$PLIST"
+            _green "Voice server plist loaded."
+            sleep 2
+        fi
+    fi
+
+    _start_service "mlx-audio" "$MLX_PID" "$MLX_LOG" \
+        --health "http://localhost:$MLX_PORT/" 15 \
+        --stderr "$MLX_ERR" \
+        -- "$VENV/bin/mlx_audio.server" --host 0.0.0.0 --port "$MLX_PORT"
+
+    _start_service "TTS proxy" "$PROXY_PID" "$PROXY_LOG" \
+        -- python3 "$SCRIPT_DIR/tts-proxy.py" --port "$PROXY_PORT" --upstream "http://localhost:$MLX_PORT"
+
+    if [[ ! -f "$PLIST" ]]; then
+        _start_service "voice server" "$VOICE_PID" "$VOICE_LOG" \
+            -- bun run "$SCRIPT_DIR/server.ts"
+    fi
+
+    cmd_status
+}
+
+cmd_stop() {
+    if [[ -f "$PLIST" ]] && launchctl list "$PLIST_LABEL" &>/dev/null 2>&1; then
+        launchctl unload "$PLIST"
+        _green "Voice server plist unloaded."
+    else
+        _stop_service "Voice server" "$VOICE_PID"
+    fi
+    _stop_service "TTS proxy" "$PROXY_PID"
+    _stop_service "mlx-audio" "$MLX_PID"
+}
+
+cmd_restart() {
+    cmd_stop 2>/dev/null || true
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    echo "── mlx-audio (port $MLX_PORT) ──"
+    if _is_running "$MLX_PID"; then
+        _green "Running (PID $(cat "$MLX_PID"))"
+    else
+        _red "Not running"
+    fi
+
+    echo ""
+    echo "── TTS Proxy (port $PROXY_PORT) ──"
+    if _is_running "$PROXY_PID"; then
+        _green "Running (PID $(cat "$PROXY_PID"))"
+    else
+        _red "Not running"
+    fi
+
+    echo ""
+    echo "── Voice Server (port $VOICE_PORT) ──"
+    if [[ -f "$PLIST" ]] && launchctl list "$PLIST_LABEL" &>/dev/null 2>&1; then
+        local pid
+        pid=$(launchctl list | grep "$PLIST_LABEL" | awk '{print $1}')
+        if [[ "$pid" == "-" ]]; then
+            _yellow "Loaded but not running (exited/crashed)"
+        else
+            _green "Running via launchd (PID: $pid)"
+        fi
+    elif _is_running "$VOICE_PID"; then
+        _green "Running (PID $(cat "$VOICE_PID"))"
+    else
+        _red "Not running"
+    fi
+
+    echo ""
+    echo "── Endpoints ──"
+    if curl -sf -o /dev/null --max-time 30 "http://localhost:$MLX_PORT/v1/audio/speech" -X POST \
+         -H "Content-Type: application/json" \
+         -d "{\"model\":\"$TTS_MODEL\",\"input\":\"ping\",\"voice\":\"$VOICE\",\"instruct\":\"$VOICE\",\"response_format\":\"opus\"}" 2>/dev/null; then
+        _green "TTS (port $MLX_PORT): responding"
+    else
+        _red "TTS (port $MLX_PORT): not responding"
+    fi
+
+    local tmpwav; tmpwav=$(mktemp /tmp/stt-health-XXXXXX.wav)
+    python3 -c "
+import struct,wave,sys
+f=wave.open(sys.argv[1],'w')
+f.setnchannels(1);f.setsampwidth(2);f.setframerate(16000)
+f.writeframes(b'\x00\x00'*16000);f.close()
+" "$tmpwav" 2>/dev/null
+    if curl -sf -o /dev/null --max-time 10 "http://localhost:$MLX_PORT/v1/audio/transcriptions" \
+         -F "file=@${tmpwav}" -F "model=$STT_MODEL" 2>/dev/null; then
+        _green "STT (port $MLX_PORT): responding"
+    else
+        _red "STT (port $MLX_PORT): not responding"
+    fi
+    rm -f "$tmpwav"
+
+    if curl -sf -o /dev/null --max-time 3 "http://localhost:$VOICE_PORT/health" 2>/dev/null; then
+        _green "Voice server (port $VOICE_PORT): responding"
+    else
+        _red "Voice server (port $VOICE_PORT): not responding"
+    fi
+
+    echo ""
+    echo "── Models ──"
+    echo "  TTS: $TTS_MODEL"
+    echo "  STT: $STT_MODEL"
+    echo "  Voice: $VOICE"
+}
+
+cmd_logs() {
+    local target="${1:-all}"
+    case "$target" in
+        mlx|audio)   tail -f "$MLX_LOG" "$MLX_ERR" ;;
+        proxy)       tail -f "$PROXY_LOG" ;;
+        voice|server) tail -f "$VOICE_LOG" ;;
+        all)         tail -f "$MLX_LOG" "$MLX_ERR" "$PROXY_LOG" "$VOICE_LOG" ;;
+        *)           _red "Unknown log target: $target (use: mlx, proxy, voice, all)" ;;
+    esac
+}
+
+cmd_update() {
+    _check_venv
+    echo "Updating mlx-audio..."
+    source "$VENV/bin/activate"
+    uv pip install --upgrade "mlx-audio[all,server]" --prerelease=allow
+    _green "Package updated."
+    echo "Refreshing models..."
+    _download_models
+    _green "Models refreshed."
+    echo "Restarting stack..."
+    cmd_restart
+}
+
+cmd_model() {
+    local action="${1:-}"
+    case "$action" in
+        list)
+            echo "Configured models:"
+            echo "  TTS: $TTS_MODEL"
+            echo "  STT: $STT_MODEL"
+            echo "  Voice: $VOICE"
+            ;;
+        swap-tts|swap-stt)
+            if [[ -z "${2:-}" ]]; then
+                _red "Usage: audio-ctl model swap-tts|swap-stt <model-id>"
+                exit 1
+            fi
+            _yellow "Note: Model IDs are passed at request time to mlx-audio."
+            _yellow "Update your client config to use: $2"
+            echo "No config change needed — mlx-audio loads models on demand."
+            ;;
+        download)
+            _check_venv
+            source "$VENV/bin/activate"
+            _download_models
+            _green "Done."
+            ;;
+        *)
+            echo "Usage: audio-ctl model <list|swap-tts|swap-stt|download>"
+            ;;
+    esac
+}
+
+cmd_dev() {
+    _check_venv
+    echo "Starting mlx-audio server in foreground (Ctrl+C to stop)..."
+    source "$VENV/bin/activate"
+    exec mlx_audio.server --host 0.0.0.0 --port "$MLX_PORT"
+}
+
+cmd_install() {
+    _ensure_workdir
+
+    if [[ -f "$PLIST" ]]; then
+        _yellow "Plist already exists at $PLIST"
+        return 0
+    fi
+
+    local bun_path; bun_path=$(command -v bun)
+    cat > "$PLIST" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$PLIST_LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$bun_path</string>
+        <string>run</string>
+        <string>$SCRIPT_DIR/server.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$SCRIPT_DIR</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${bun_path%/*}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$VOICE_LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$VOICE_LOG</string>
+</dict>
+</plist>
+PLISTEOF
+
+    _green "Plist installed to $PLIST"
+    echo "Run 'audio-ctl start' to load it."
+}
+
+cmd_uninstall() {
+    if [[ -f "$PLIST" ]]; then
+        launchctl unload "$PLIST" 2>/dev/null || true
+        rm -f "$PLIST"
+        _green "Plist removed from $PLIST"
+    else
+        _yellow "No plist found."
+    fi
+}
+
+cmd_help() {
+    cat <<'EOF'
+audio-ctl — Manage voiceserver stack (mlx-audio + tts-proxy + voiceserver)
+
+The voice pipeline: voiceserver (8888) → tts-proxy (8001) → mlx-audio (8000)
+
+Commands:
+  start           Start the full stack (mlx + proxy + voice server)
+  stop            Stop the full stack
+  restart         Stop then start the full stack
+  status          Show status of all services and endpoints
+  logs [target]   Tail logs (mlx, proxy, voice, all [default])
+  install         Install launchd plist for voice server (auto-restart)
+  uninstall       Remove launchd plist
+  update          Upgrade mlx-audio package and refresh models
+  model <action>  Model management:
+                    list        Show configured models
+                    swap-tts ID Change TTS model
+                    swap-stt ID Change STT model
+                    download    Pre-download all models
+  dev             Run mlx-audio server in foreground (for testing)
+  help            Show this help
+
+Examples:
+  audio-ctl install     # One-time: install launchd plist
+  audio-ctl start       # Start everything
+  audio-ctl logs proxy  # Watch proxy logs
+  audio-ctl status      # Check all services
+EOF
+}
+
+case "${1:-help}" in
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    restart)    cmd_restart ;;
+    status)     cmd_status ;;
+    logs)       cmd_logs "${2:-all}" ;;
+    install)    cmd_install ;;
+    uninstall)  cmd_uninstall ;;
+    update)     cmd_update ;;
+    model)      cmd_model "${2:-}" "${3:-}" ;;
+    dev)        cmd_dev ;;
+    help|--help|-h) cmd_help ;;
+    *)          _red "Unknown command: $1"; echo; cmd_help; exit 1 ;;
+esac
