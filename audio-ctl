@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: audio-ctl <command> [args]
 #
 # Manages the full voice pipeline:
-#   voiceserver (8888) → tts-proxy (8001) → mlx-audio (8000)
+#   voiceserver (31337) → tts-proxy (8001) → mlx-audio (8000)
 
 VENV="$HOME/.venvs/audio-services"
 PLIST="$HOME/Library/LaunchAgents/com.local.voiceserver.plist"
@@ -14,7 +14,7 @@ WORKDIR="$SCRIPT_DIR/workspace"
 
 MLX_PORT="8000"
 PROXY_PORT="8001"
-VOICE_PORT="8888"
+VOICE_PORT="31337"
 
 MLX_PID="$WORKDIR/mlx-audio.pid"
 MLX_LOG="$WORKDIR/mlx-audio.log"
@@ -378,7 +378,7 @@ cmd_help() {
     cat <<'EOF'
 audio-ctl — Manage voiceserver stack (mlx-audio + tts-proxy + voiceserver)
 
-The voice pipeline: voiceserver (8888) → tts-proxy (8001) → mlx-audio (8000)
+The voice pipeline: voiceserver (31337) → tts-proxy (8001) → mlx-audio (8000)
 
 Commands:
   start           Start the full stack (mlx + proxy + voice server)
