@@ -1,4 +1,24 @@
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs"
+import { join } from "node:path"
+
+// Load .env file
+const envPath = join(import.meta.dir, ".env")
+try {
+  const envContent = readFileSync(envPath, "utf-8")
+  for (const line of envContent.split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    const eqIdx = trimmed.indexOf("=")
+    if (eqIdx === -1) continue
+    const key = trimmed.slice(0, eqIdx).trim()
+    let value = trimmed.slice(eqIdx + 1).trim()
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    if (!process.env[key]) process.env[key] = value
+  }
+} catch { /* .env not found */ }
+
 import {
   PORT,
   TTS_URL,
@@ -7,6 +27,10 @@ import {
   VOICES_FILE,
   VOICE_POOL,
   SEED_VOICES,
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_URL,
+  ELEVENLABS_MODEL,
+  ELEVENLABS_DEFAULT_VOICE_ID,
 } from "./config"
 
 // ── Voice Registry ──────────────────────────────────────────
@@ -75,6 +99,57 @@ function playAudio(buffer: ArrayBuffer) {
   })
 }
 
+// ── ElevenLabs TTS Proxy ─────────────────────────────────────
+
+interface ElevenLabsVoiceSettings {
+  stability?: number
+  similarity_boost?: number
+  style?: number
+  speed?: number
+  use_speaker_boost?: boolean
+}
+
+async function elevenlabsSynthesize(
+  text: string,
+  voiceId: string,
+  voiceSettings?: ElevenLabsVoiceSettings,
+): Promise<ArrayBuffer | null> {
+  const apiKey = ELEVENLABS_API_KEY
+  if (!apiKey) {
+    throw new Error("ElevenLabs API key not configured")
+  }
+
+  const url = `${ELEVENLABS_URL}/${voiceId}`
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "audio/mpeg",
+      "Content-Type": "application/json",
+      "xi-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      text,
+      model_id: ELEVENLABS_MODEL,
+      voice_settings: voiceSettings ?? {
+        stability: 0.5,
+        similarity_boost: 0.75,
+        style: 0.0,
+        speed: 1.0,
+        use_speaker_boost: true,
+      },
+    }),
+    signal: AbortSignal.timeout(60_000),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`)
+  }
+
+  return response.arrayBuffer()
+}
+
 // ── Server — accepts from any source ────────────────────────
 
 Bun.serve({
@@ -117,6 +192,56 @@ Bun.serve({
       synthesize(message, voice, speed).then(audio => { if (audio) playAudio(audio) })
 
       return new Response("ok", { headers: corsHeaders })
+    }
+
+    if (url.pathname === "/notify/elevenlabs" && req.method === "POST") {
+      let body: any
+      try { body = await req.json() } catch {
+        return new Response(JSON.stringify({ status: "error", message: "Invalid JSON body" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        })
+      }
+
+      const message: string = body?.message
+      const voiceId: string = body?.voice_id ?? ELEVENLABS_DEFAULT_VOICE_ID
+      const voiceSettings = body?.voice_settings
+
+      if (!message || message.trim().length === 0) {
+        return new Response(JSON.stringify({ status: "error", message: "Message is required and must be non-empty" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        })
+      }
+
+      if (!ELEVENLABS_API_KEY) {
+        return new Response(JSON.stringify({ status: "error", message: "ElevenLabs API key not configured" }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        })
+      }
+
+      try {
+        const audio = await elevenlabsSynthesize(message, voiceId, voiceSettings)
+        if (audio) {
+          const tmpFile = `/tmp/voice-el-${Date.now()}.mp3`
+          writeFileSync(tmpFile, Buffer.from(audio))
+          Bun.spawn(["afplay", tmpFile], {
+            detached: true,
+            onExit() {
+              try { unlinkSync(tmpFile) } catch {}
+            },
+          })
+        }
+        return new Response(JSON.stringify({ status: "success", message: "TTS complete" }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        })
+      } catch (err: any) {
+        return new Response(JSON.stringify({ status: "error", message: err.message }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        })
+      }
     }
 
     return new Response("not found", { status: 404, headers: corsHeaders })

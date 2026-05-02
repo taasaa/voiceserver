@@ -4,6 +4,12 @@ export const TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
 export const AUDIO_FORMAT = "mp3"
 export const VOICES_FILE = import.meta.dir + "/voices.json"
 
+// ElevenLabs configuration
+export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? ""
+export const ELEVENLABS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+export const ELEVENLABS_MODEL = "eleven_turbo_v2_5"
+export const ELEVENLABS_DEFAULT_VOICE_ID = "CwhRBWXzGAHq8TQ4Fs17"
+
 const defaultVoice = "A clear, professional male voice. Calm and direct, mid-range pitch."
 const mainVoice = "A composed, precise male voice. High energy, direct, moderately warm."
 

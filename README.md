@@ -62,7 +62,29 @@ Returns `"ok"`. Used for health checks.
 }
 ```
 
-Fires TTS asynchronously and returns `"ok"` immediately. Audio plays locally on the server machine.
+Fires TTS asynchronously via mlx-audio (Qwen3-TTS) and returns `"ok"` immediately. Audio plays locally on the server machine.
+
+### POST /notify/elevenlabs
+
+ElevenLabs TTS proxy endpoint. Receives the same request shape as Pulse's `/notify`, forwards to ElevenLabs API, plays audio locally.
+
+```json
+{
+  "message": "Text to speak",
+  "voice_id": "CwhRBWXzGAHq8TQ4Fs17",
+  "voice_settings": {
+    "stability": 0.5,
+    "similarity_boost": 0.75,
+    "style": 0.0,
+    "speed": 1.0,
+    "use_speaker_boost": true
+  }
+}
+```
+
+Returns `{ "status": "success", "message": "TTS complete" }` on success, or error JSON with appropriate HTTP status.
+
+**Configuration:** Requires `ELEVENLABS_API_KEY` in `.env` file (gitignored). See `.env.example` for required variables.
 
 ## Voice Registry
 
@@ -86,13 +108,17 @@ Known voice IDs:
 ```
 voiceserver/
 ├── server.ts          # Main Bun server — voice registry, TTS, playback
-├── config.ts          # Ports, model IDs, voice pool, seed voices
+├── config.ts          # Ports, model IDs, voice pool, seed voices, ElevenLabs config
 ├── audio-ctl          # Stack management script (start/stop/status/etc)
 ├── tts-proxy.py       # Instruct injection proxy for Qwen3-TTS
 ├── voices.json        # Persisted voice ID → description mappings
 ├── workspace/         # Runtime logs and PIDs (gitignored)
 ├── CLAUDE.md          # Minimal context for AI sessions
 └── docs.md            # This file — full documentation
+
+# Environment (gitignored)
+.env                   # ELEVENLABS_API_KEY
+.env.example           # Template for required environment variables
 ```
 
 ## Setup from Scratch
