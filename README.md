@@ -66,20 +66,33 @@ Fires TTS asynchronously via mlx-audio (Qwen3-TTS) and returns `"ok"` immediatel
 
 ### POST /notify/elevenlabs
 
-ElevenLabs TTS proxy endpoint. Receives the same request shape as Pulse's `/notify`, forwards to ElevenLabs API, plays audio locally.
+ElevenLabs TTS proxy endpoint. Pass-through to ElevenLabs API — plays audio locally.
 
+Can be called with voice ID in URL path (`/notify/elevenlabs/{voiceId}`) or in body (`voice_id`).
+
+**Request body fields:**
+- `text` or `message` — text to synthesize (required)
+- `voice_id` — ElevenLabs voice ID (optional, defaults to configured default)
+- `model_id` — ElevenLabs model ID (optional, defaults to `eleven_turbo_v2_5`)
+- `voice_settings` — object with stability, similarity_boost, style, speed, use_speaker_boost
+
+**Example:**
 ```json
 {
-  "message": "Text to speak",
+  "text": "Hello world",
   "voice_id": "CwhRBWXzGAHq8TQ4Fs17",
+  "model_id": "eleven_turbo_v2_5",
   "voice_settings": {
     "stability": 0.5,
-    "similarity_boost": 0.75,
-    "style": 0.0,
-    "speed": 1.0,
-    "use_speaker_boost": true
+    "similarity_boost": 0.75
   }
 }
+```
+
+**Alternative — voice ID in URL:**
+```bash
+POST /notify/elevenlabs/SAz9YHcvj6GT2YYXdXww
+{"text": "Hello", "model_id": "eleven_turbo_v2_5"}
 ```
 
 Returns `{ "status": "success", "message": "TTS complete" }` on success, or error JSON with appropriate HTTP status.
