@@ -113,6 +113,7 @@ async function elevenlabsSynthesize(
   text: string,
   voiceId: string,
   voiceSettings?: ElevenLabsVoiceSettings,
+  modelId: string = ELEVENLABS_MODEL,
 ): Promise<ArrayBuffer | null> {
   const apiKey = ELEVENLABS_API_KEY
   if (!apiKey) {
@@ -130,7 +131,7 @@ async function elevenlabsSynthesize(
     },
     body: JSON.stringify({
       text,
-      model_id: ELEVENLABS_MODEL,
+      model_id: modelId,
       voice_settings: voiceSettings ?? {
         stability: 0.5,
         similarity_boost: 0.75,
@@ -194,7 +195,10 @@ Bun.serve({
       return new Response("ok", { headers: corsHeaders })
     }
 
-    if (url.pathname === "/notify/elevenlabs" && req.method === "POST") {
+    // POST /notify/elevenlabs — pass-through to ElevenLabs
+    // Can also be /notify/elevenlabs/{voiceId} to specify voice in URL path
+    const elevenlabsMatch = url.pathname.match(/^\/notify\/elevenlabs(?:\/(.+))?$/)
+    if (elevenlabsMatch && req.method === "POST") {
       let body: any
       try { body = await req.json() } catch {
         return new Response(JSON.stringify({ status: "error", message: "Invalid JSON body" }), {
@@ -203,8 +207,12 @@ Bun.serve({
         })
       }
 
-      const message: string = body?.message
-      const voiceId: string = body?.voice_id ?? ELEVENLABS_DEFAULT_VOICE_ID
+      // Accept message or text field
+      const message: string = body?.message ?? body?.text
+      // Voice ID from URL path or request body
+      const voiceId: string = elevenlabsMatch[1] ?? body?.voice_id ?? ELEVENLABS_DEFAULT_VOICE_ID
+      // Model ID from request body (default to configured model)
+      const modelId: string = body?.model_id ?? ELEVENLABS_MODEL
       const voiceSettings = body?.voice_settings
 
       if (!message || message.trim().length === 0) {
@@ -222,7 +230,7 @@ Bun.serve({
       }
 
       try {
-        const audio = await elevenlabsSynthesize(message, voiceId, voiceSettings)
+        const audio = await elevenlabsSynthesize(message, voiceId, voiceSettings, modelId)
         if (audio) playAudio(audio)
         return new Response(JSON.stringify({ status: "success", message: "TTS complete" }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
