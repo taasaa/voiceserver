@@ -1,4 +1,4 @@
-export const PORT = 31337
+export const PORT = 8888
 export const TTS_URL = "http://localhost:8001/v1/audio/speech"
 export const TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
 export const AUDIO_FORMAT = "mp3"
