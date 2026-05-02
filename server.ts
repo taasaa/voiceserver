@@ -223,16 +223,7 @@ Bun.serve({
 
       try {
         const audio = await elevenlabsSynthesize(message, voiceId, voiceSettings)
-        if (audio) {
-          const tmpFile = `/tmp/voice-el-${Date.now()}.mp3`
-          writeFileSync(tmpFile, Buffer.from(audio))
-          Bun.spawn(["afplay", tmpFile], {
-            detached: true,
-            onExit() {
-              try { unlinkSync(tmpFile) } catch {}
-            },
-          })
-        }
+        if (audio) playAudio(audio)
         return new Response(JSON.stringify({ status: "success", message: "TTS complete" }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         })
